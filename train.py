@@ -3,7 +3,7 @@
 
 """ train network using pytorch
 
-author baiyu
+author chenzy 20210114
 """
 
 import os
