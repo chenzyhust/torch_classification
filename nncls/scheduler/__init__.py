@@ -16,9 +16,7 @@ def build_scheduler(cfg, optimizer):
     else:
         raise ValueError(
             'the lr scheduler name you entered is not supported yet')
-    if cfg.DIST and dist.get_rank() == 0:
-        print("use lr scheduler: ", scheduler_name)
-    elif not cfg.DIST:
+    if not cfg.DIST or (cfg.DIST and dist.get_rank() == 0):
         print("use lr scheduler: ", scheduler_name)
 
     return scheduler

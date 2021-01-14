@@ -4,20 +4,20 @@ import torch.nn.functional as F
 
 class MixLoss:
     def __init__(self):
-        slef.criterion = nn.CrossEntropyLoss()
+        self.criterion = nn.CrossEntropyLoss()
     
-    def __call__(preds, labels):
+    def __call__(self, preds, labels):
         label_a, label_b , lam = labels
-        return lam * criterion(pred, label_a) + (1 - lam) * criterion(pred, label_b)
+        return lam * self.criterion(preds, label_a) + (1 - lam) * self.criterion(preds, label_b)
 
 class RicapLoss:
-    def __inti__(self):
-        slef.criterion = nn.CrossEntropyLoss()
+    def __init__(self):
+        self.criterion = nn.CrossEntropyLoss()
     
-    def __call__(preds, labels):
+    def __call__(self, preds, labels):
         labels_list, weights = labels
         return sum([
-            weight * slef.criterion(preds, labels)
+            weight * self.criterion(preds, labels)
             for labels, weight in zip(labels_list, weights)
         ])
 

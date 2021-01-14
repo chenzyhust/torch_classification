@@ -13,11 +13,13 @@ _C.TIME_NOW            = datetime.now().strftime(_C.DATE_FORMAT)
 _C.LOG_DIR             = 'runs'      # tensorboard log dir
 _C.SAVE_EPOCH          = 10          # save weights file per SAVE_EPOCH epoch
 _C.GPU                 = True        # whether to use GPU
-_C.NET                 = "resnet50"  # net type
-_C.DIST                = True       # torch.distributed
+_C.NET                 = "mobilenetv3" # net type
+_C.DIST                = True        # torch.distributed
 _C.LOCAL_RANK          = 0
 _C.DEVICE              = 'cuda'      # cuda or cpu
-_C.SYNC_BN             = False       
+_C.SYNC_BN             = False            
+_C.APEX                = True
+_C.OPT_LEVEL           = 'O1'
 
 # train parameters 
 _C.TRAIN = CN()
@@ -27,20 +29,25 @@ _C.TRAIN.EPOCHES     = 200               # total training epoches
 _C.TRAIN.BATCH       = 128               # batch size dp : ALL=BATCH  dist : ALL=BATCH * world_size
 _C.TRAIN.WARM        = 5                 # warm up epoches
 _C.TRAIN.OPTIM       = "sgd"             # optim type 
-_C.TRAIN.LR          = 0.4              # initial learning rate
-_C.TRAIN.SCHEDULER   = "cosine"          # learning rate adjust type step or cosine
+_C.TRAIN.LR          = 0.4               # initial learning rate
+_C.TRAIN.SCHEDULER   = "cosine"            # learning rate adjust type step or cosine
 _C.TRAIN.STEPS       = [60, 120, 160]
 _C.TRAIN.RESUME      = False             # resume training
 _C.TRAIN.GPU_ID      = "0,1,2,3"         # id(s) for CUDA_VISIBLE_DEVICES
-_C.TRAIN.CUDNN       = True              # cudnn.benchmark 
+_C.TRAIN.CUDNN       = False             # cudnn.benchmark 
+_C.TRAIN.DETEM       = True              # cudnn.deterministic
 _C.TRAIN.SEED        = 0
+_C.TRAIN.SWA         = False
+_C.TRAIN.SWA_START   = 161
+_C.TRAIN.SWA_LR      = 0.2
+_C.TRAIN.SWA_CEPO    = 1                 # SWA model collection frequency/cycle length in epochs (default: 1)
 
 # aug strategy
 _C.AUG = CN()
-_C.AUG.PROB         = 1           # probability of data aug
+_C.AUG.PROB         = 0.5         # probability of data aug
 #                   : mixup
 _C.AUG.MIXUP        = False       # whether to use mixup
-_C.AUG.MIXUP_A      = 0.5         # mixup alpha paramter
+_C.AUG.MIXUP_A      = 1           # mixup alpha paramter
 #                   : cutout & dual cutout
 _C.AUG.CUTOUT       = False       # whether to use cutout
 _C.AUG.D_CUTOUT     = False       # whether to use dualcutout
@@ -53,7 +60,7 @@ _C.AUG.M_ATTEMPT    = 20          # num of max attempt
 _C.AUG.A_RAT_RANGE  = [0.02, 0.4] # area ratio range
 _C.AUG.M_ASP_RATIO  = 0.3         # min aspect ration
 #                   : cutmix
-_C.AUG.CUTMIX       = False       # whether to use cutmix
+_C.AUG.CUTMIX       = True        # whether to use cutmix
 _C.AUG.CUTMIX_BETA  = 1           # hyperparameter beta of cutmix
 #                   : ricap
 _C.AUG.RICAP        = False       # whether to use ricap

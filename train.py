@@ -11,22 +11,41 @@ import sys
 import argparse
 import time
 from datetime import datetime
+from copy import deepcopy
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
-from utils import (get_training_dataloader, get_test_dataloader, accuracy, 
-                   most_recent_folder, most_recent_weights, last_epoch, best_acc_weights, 
-                   AverageMeter, set_seed)
+from utils import *
 from config.config import get_cfg_defaults
 from nncls.models import build_network
 from nncls.losses import build_loss
 from nncls.optim import build_optim
 from nncls.scheduler import build_scheduler, WarmUpLR
 from nncls.transformer import build_transformer, aug_data
+from nncls.utils import *
+
+try:
+    import apex
+    from apex.parallel import DistributedDataParallel as DDP
+    from apex.fp16_utils import *
+    from apex import amp, optimizers
+    from apex.multi_tensor_apply import multi_tensor_applier
+except ImportError:
+    raise ImportError("Please install apex from https://www.github.com/nvidia/apex to run this example.")
+
+def schedule(epoch):
+    t = (epoch) / (cfg.TRAIN.SWA_START)
+    lr_ratio = cfg.TRAIN.SWA_LR / cfg.TRAIN.LR 
+    if t <= 0.5:
+        factor = 1.0
+    elif t <= 0.9:
+        factor = 1.0 - (1.0 - lr_ratio) * (t - 0.5) / 0.4
+    else:
+        factor = lr_ratio
+    return cfg.TRAIN.LR * factor
 
 def train(epoch):
     start = time.time()
@@ -36,15 +55,45 @@ def train(epoch):
             labels = labels.cuda()
             images = images.cuda()
         r = np.random.rand(1)
-        if r < cfg.AUG.PROB:
-            aug_images, aug_labels = aug_data(cfg, images, labels)
-        
-        optimizer.zero_grad()
-        outputs = net(aug_images)
-        loss = train_loss(outputs, aug_labels)
-        loss.backward()
-        optimizer.step()
-
+        #aug_images, aug_labels = images, labels
+        if cfg.TRAIN.OPTIM == 'sam':
+            def closure():
+                optimizer.zero_grad()
+                if r < cfg.AUG.PROB:
+                    aug_images, aug_labels = aug_data(cfg, images, labels)
+                    outputs = net(aug_images)
+                    loss = aug_loss(outputs, aug_labels)
+                else:
+                    aug_images, aug_labels = images, labels
+                    outputs = net(aug_images)
+                    loss = train_loss(outputs, aug_labels)
+                if cfg.APEX:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
+                return loss
+            loss = optimizer.step(closure)
+        else:
+            optimizer.zero_grad()
+            if r < cfg.AUG.PROB:
+                aug_images, aug_labels = aug_data(cfg, images, labels)
+                outputs = net(aug_images)
+                loss = aug_loss(outputs, aug_labels)
+            else:
+                aug_images, aug_labels = images, labels
+                outputs = net(aug_images)
+                loss = train_loss(outputs, aug_labels)
+            
+            # outputs = net(aug_images)
+            # loss = train_loss(outputs, aug_labels)
+            if cfg.APEX:
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
+            
+            optimizer.step()
         if epoch <= cfg.TRAIN.WARM:
             warmup_scheduler.step()
 
@@ -95,7 +144,7 @@ def train(epoch):
         print('epoch {} training time consumed: {:.2f}s'.format(epoch, finish - start))
    
 @torch.no_grad()
-def eval_training(epoch=0, tb=True):
+def eval_training(net, epoch=0, tb=True, suffix=''):
 
     start = time.time()
     net.eval()
@@ -141,11 +190,13 @@ def eval_training(epoch=0, tb=True):
             torch.cuda.synchronize()     
     if not cfg.DIST or (cfg.DIST and dist.get_rank() == 0):
         finish = time.time()
-        if cfg.GPU:
-            print('GPU INFO.....')
-            print(torch.cuda.memory_summary(), end='')
-        print('Evaluating Network.....')
-        print('Test set: Epoch: {}, Avg loss: {:.4f}, Top 1 Acc: {:.4f}, Top 5 Acc: {:.4f}, Time consumed:{:.2f}s'.format(
+        if suffix == '':
+            if cfg.GPU:
+                print('GPU INFO.....')
+                print(torch.cuda.memory_summary(), end='')
+            print('Evaluating Network.....')
+        print('{} Test set: Epoch: {}, Avg loss: {:.4f}, Top 1 Acc: {:.4f}, Top 5 Acc: {:.4f}, Time consumed:{:.2f}s'.format(
+            suffix,
             epoch,
             loss_meter.avg,
             acc1_meter.avg,
@@ -158,7 +209,7 @@ def eval_training(epoch=0, tb=True):
             writer.add_scalar('Test/Average loss', loss_meter.avg, epoch)
             writer.add_scalar('Test/Accuracy', acc1_meter.avg, epoch)
     
-    return acc1_meter.avg
+    return acc1_meter.avg, acc5_meter.avg
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -168,8 +219,8 @@ if __name__ == '__main__':
     cfg = get_cfg_defaults()
     cfg.LOCAL_RANK = args.local_rank
     os.environ['CUDA_VISIBLE_DEVICES'] = cfg.TRAIN.GPU_ID
-   
-    cudnn.benchmark = cfg.TRAIN.CUDNN
+    torch.backends.cudnn.deterministic = cfg.TRAIN.DETEM 
+    torch.backends.cudnn.benchmark = cfg.TRAIN.CUDNN
     if cfg.DIST:
         torch.cuda.set_device(cfg.LOCAL_RANK)
         dist.init_process_group(backend='nccl')
@@ -183,6 +234,14 @@ if __name__ == '__main__':
         print('use gpu id: ', cfg.TRAIN.GPU_ID)
     
     net = build_network(cfg)
+    if cfg.APEX and cfg.DIST and cfg.SYNC_BN:
+        net = apex.parallel.convert_syncbn_model(net)
+        if dist.get_rank() == 0:
+            print('using apex synced BN')
+    elif not cfg.APEX and cfg.DIST and cfg.SYNC_BN:
+        net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)(net)
+        if dist.get_rank() == 0:
+            print('using torch ddp synced BN')
     #data preprocessing:
     cifar100_training_loader = get_training_dataloader(
         cfg,
@@ -202,13 +261,30 @@ if __name__ == '__main__':
         shuffle=True
     )
    
-    train_loss, val_loss = build_loss(cfg)
+    train_loss, aug_loss, val_loss = build_loss(cfg)
     optimizer = build_optim(cfg, net)
+    swa_model = None
+    if cfg.TRAIN.SCHEDULER == 'step' and cfg.TRAIN.SWA:
+        swa_model = deepcopy(net)
+        swa_n = 0
+    # 通过调整下面的opt_level实现半精度训练。
+    # opt_level选项有：'O0', 'O1', 'O2', 'O3'.
+    # 其中'O0'是fp32常规训练，'O1'、'O2'是fp16训练，'O3'则可以用来推断但不适合拿来训练（不稳定）
+    # 注意，当选用fp16模式进行训练时，keep_batchnorm默认是None，无需设置；
+    # scale_loss是动态模式，可以设置也可以不设置。
+    if cfg.APEX:
+        net, optimizer = amp.initialize(net, optimizer,
+                                        opt_level=cfg.OPT_LEVEL)
+        net = DDP(net)
+
     train_scheduler = build_scheduler(cfg, optimizer)
     iter_per_epoch = len(cifar100_training_loader)
     warmup_scheduler = WarmUpLR(optimizer, iter_per_epoch * cfg.TRAIN.WARM)
     resume_epoch = 1
-    writer = None
+    writer = SummaryWriter(log_dir=os.path.join(
+                cfg.LOG_DIR, cfg.NET, cfg.TIME_NOW))
+    # setup exponential moving average of model weights, SWA could be used here too
+        
     if not cfg.DIST or (cfg.DIST and dist.get_rank() == 0):
         print('----------------config-----------------')
    
@@ -228,9 +304,7 @@ if __name__ == '__main__':
 
         #since tensorboard can't overwrite old values
         #so the only way is to create a new tensorboard log
-        writer = SummaryWriter(log_dir=os.path.join(
-                cfg.LOG_DIR, cfg.NET, cfg.TIME_NOW))
-        input_tensor = torch.Tensor(1, 3, 32, 32).cuda()
+        #input_tensor = torch.Tensor(1, 3, 32, 32).cuda()
         #writer.add_graph(net, input_tensor)
 
         #create checkpoint folder to save model
@@ -238,8 +312,12 @@ if __name__ == '__main__':
             os.makedirs(checkpoint_path)
         checkpoint_path = os.path.join(checkpoint_path, '{net}-{epoch}-{type}.pth')
 
-        best_acc = 0.0
+        best_acc1 = 0.0
         best_epoch = 1
+        best_acc5 = 0.0
+        if cfg.TRAIN.SWA:
+            best_swa_acc1 = 0.0
+            best_swa_acc5 = 0.0
         if cfg.TRAIN.RESUME:
             best_weights = best_acc_weights(os.path.join(cfg.CHECKPOINT_PATH, cfg.NET, recent_folder))
             if best_weights:
@@ -267,7 +345,11 @@ if __name__ == '__main__':
 
     for epoch in range(1, cfg.TRAIN.EPOCHES):
         if epoch > cfg.TRAIN.WARM:
-            train_scheduler.step(epoch)
+            if cfg.TRAIN.SWA:
+                lr = schedule(epoch)
+                adjust_learning_rate(optimizer, lr)
+            else:
+                train_scheduler.step(epoch)
 
         if cfg.TRAIN.RESUME:
             if epoch <= resume_epoch:
@@ -275,22 +357,33 @@ if __name__ == '__main__':
         if cfg.DIST:
             cifar100_training_loader.sampler.set_epoch(epoch)
         train(epoch)
-        acc = eval_training(epoch)
+        acc1, acc5 = eval_training(net, epoch)
+        if cfg.TRAIN.SWA and  epoch >= cfg.TRAIN.SWA_START:
+            moving_average(swa_model, net, 1.0 / (swa_n + 1))
+            swa_n += 1
+            bn_update(cifar100_training_loader, swa_model)
+            swa_acc1, swa_acc5 = eval_training(swa_model, epoch, suffix='SWA')
+            if not cfg.DIST or (cfg.DIST and dist.get_rank() == 0):
+                if best_swa_acc1 < swa_acc1:
+                    best_swa_acc1 = swa_acc1
+                    best_swa_acc5 = swa_acc5
+                print('best swa acc1: {:.4f}, best swa acc5: {:.4f}'.format(best_swa_acc1, best_swa_acc5))
+                print()
         #start to save best performance model after learning rate decay to 0.01
         if not cfg.DIST or (cfg.DIST and dist.get_rank() == 0):
-           
-            if epoch >  cfg.TRAIN.STEPS[1] and best_acc < acc:
+            if epoch >  cfg.TRAIN.STEPS[1] and best_acc1 < acc1:
                 if not cfg.DIST:
                     torch.save(net.state_dict(), checkpoint_path.format(net=cfg.NET, epoch=epoch, type='best'))
                 else:
                     torch.save(net.module.state_dict(), checkpoint_path.format(net=cfg.NET, epoch=epoch, type='best'))
-                best_acc = acc
+                best_acc1 = acc1
+                best_acc5 = acc5
                 best_epoch = epoch
-                print('best epoch: {}, best acc: {:.4f}'.format(best_epoch, best_acc))
+                print('best epoch: {}, best acc1: {:.4f}, acc5: {:.4f}'.format(best_epoch, best_acc1, best_acc5))
                 print()
                 continue
             if epoch > cfg.TRAIN.STEPS[1]:
-                print('best epoch: {}, best acc: {:.4f}'.format(best_epoch, best_acc))
+                print('best epoch: {}, best acc1: {:.4f}, acc5: {:.4f}'.format(best_epoch, best_acc1, best_acc5))
                 print()
             if not epoch % cfg.SAVE_EPOCH:
                 if not cfg.DIST:

@@ -8,25 +8,24 @@ def build_transformer(cfg):
     transformer = []
     trans_name = []
     if cfg.AUG.CUTOUT:
-        trans_name.appen('Cutout')
+        trans_name.append('Cutout')
         transformer.append(Cutout(n_holes=cfg.AUG.N_HOLES, 
                                   length=cfg.AUG.LENGTH, 
                                   prob=cfg.AUG.PROB))
     if cfg.AUG.D_CUTOUT:
-        trans_name.appen('DualCutout')
+        trans_name.append('DualCutout')
         transformer.append(DualCutout(n_holes=cfg.AUG.N_HOLES, 
                                       length=cfg.AUG.LENGTH, 
                                       prob=cfg.AUG.PROB))
     if cfg.AUG.R_ERASING:
-        trans_name.appen('Random Erasing')
+        trans_name.append('Random Erasing')
         transformer.append(RandomErasing(prob=cfg.AUG.PROB,
                                          max_attempt=cfg.AUG.M_ATTEMPT,
                                          area_ratio_range=cfg.AUG.A_RAT_RANGE,
                                          min_aspect_ratio=cfg.AUG.M_ASP_RATIO))
-    if cfg.DIST and dist.get_rank() == 0:
+    if not cfg.DIST or (cfg.DIST and dist.get_rank() == 0):
         print("use extra transforms: ", [t for t in trans_name])
-    elif not cfg.DIST:
-        print("use extra transforms: ", [t for t in trans_name])
+    
     return transformer
 
 def aug_data(cfg, x, y):
@@ -96,7 +95,7 @@ def cutmix_data(x, y, beta=1.0, use_cuda=True):
     lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
     targets = [y_a, y_b, lam]
 
-    return x, y_a, y_b, lam
+    return x, targets
 
 def ricap_data(x, y, beta=0.3):
     I_x, I_y = x.size()[2:]
@@ -115,15 +114,15 @@ def ricap_data(x, y, beta=0.3):
         y_k = np.random.randint(0, I_y - h_[k] + 1)
         cropped_images[k] = x[idx][:, :, x_k:x_k + w_[k], y_k:y_k + h_[k]]
         c_.append(y[idx].cuda())
-        w_.append(w_[k] * h_[k] / (I_x * I_y))
-        #c_[k] = y[idx].cuda()
-        #W_[k] = w_[k] * h_[k] / (I_x * I_y)
+        W_.append(w_[k] * h_[k] / (I_x * I_y))
+        c_[k] = y[idx].cuda()
+        W_[k] = w_[k] * h_[k] / (I_x * I_y)
 
     patched_images = torch.cat(
         (torch.cat((cropped_images[0], cropped_images[1]), 2),
         torch.cat((cropped_images[2], cropped_images[3]), 2)),
     3)
-    targets = [c_, w_]
+    targets = [c_, W_]
 
     return patched_images, targets
 
